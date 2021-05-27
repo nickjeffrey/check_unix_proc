@@ -1,0 +1,309 @@
+#!/usr/bin/perl -w
+
+
+# OUTSTANDING TASKS
+# -----------------
+
+
+#
+# Nagios plugin for checking running processes on assorted UNIX systems
+#
+
+
+# CHANGE LOG
+# ---------- 
+#  2012-05-26	Nick Jeffrey	Create script to check UNIX processes (based on earlier script for filesystem space)
+#  2014-04-04	Nick Jeffrey	Add error checks
+#  2015-05-04	Nick Jeffrey	Add --owner switch 
+#  2015-05-04	Nick Jeffrey	Allow space character in process name  
+
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking running processes
+#   # If no thresholds are specified, default to min=1 max=1 owner=""
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             process dhcpd
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_proc --min=1 --max=5 owner=root dhcpd"
+#           }
+#
+#  If you are using the check_nrpe method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  Note that the format is check_nrpe!check_unix_proc!min!max!processname
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             process dhcpd
+#           check_command                   check_nrpe!check_unix_proc!1!5!root!dhcpd
+#           }
+#
+#  If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:
+#   command[check_unix_proc]=/usr/local/nagios/libexec/check_unix_process --min=$ARG1$ --max=$ARG2$ --owner=$ARG3$ $ARG4$
+#
+#
+#
+# Please note that the --owner switch is optional.  If you do not specify the --owner switch, the process will check for *any* owner.
+# 
+# If you need to check for a process name that contains embedded spaces, wrap the whole process with escaped quotes.  For example:
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_proc --min=1 --max=5 owner=root \"/path/to/procname -xyz -abc\""
+
+
+
+
+
+use strict;				#enforce good coding practices
+use Getopt::Long;			#allow --long-switches to be used as parameters
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME);
+my ($ps,$procname,$proc_count,$proc_count_min,$proc_count_max,$nagios_return_code,$uname);
+my ($opt_help,$opt_min,$opt_max,$opt_owner,$owner);
+my ($os);
+my ($verbose);
+$CHECK_NAME                 = "processes";
+$verbose                    = "no";			#yes/no variable to increase output for debugging
+
+#
+# Nagios return codes
+#
+$OK=		0;
+$WARN=		1;
+$CRITICAL=	2;
+$UNKNOWN=	3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_help, "help"    => \$opt_help,
+      "n=s" => \$opt_min,  "min=s"   => \$opt_min, 
+      "x=s" => \$opt_max,  "max=s"   => \$opt_max,
+      "o=s" => \$opt_owner,"owner=s" => \$opt_owner,
+   );
+   #
+   # If the user did not supply a --min= threshold, use 1 process.
+   #
+   if( ! defined( $opt_min ) ) {
+      $opt_min = 1;
+      print "   setting min=1 \n" if ($verbose eq "yes");
+   }
+   print "   --min=$opt_min \n" if ($verbose eq "yes");
+   #
+   $proc_count_min = $opt_min;
+   #
+   # If the user did not supply a --max= threshold, use 1 process
+   #
+   if( ! defined( $opt_max ) ) {
+      $opt_max = 1;
+      print "   setting max=1 \n" if ($verbose eq "yes");
+   }
+   print "   --max=$opt_max \n" if ($verbose eq "yes");
+   #
+   # If the user did not supply --owner=username use blank
+   #
+   if( ! defined( $opt_owner ) ) {
+      $opt_owner = "";
+      print "   setting owner=\"\" \n" if ($verbose eq "yes");
+   }
+   print "   --owner=$opt_owner \n" if ($verbose eq "yes");
+   #
+   $proc_count_max = $opt_max;
+}			#end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # figure out where the ps command is on this system (varies across UNIX flavors)
+   $ps = "/bin/ps"            if ( -e "/bin/ps" );
+   $ps = "/usr/bin/ps"        if ( -e "/usr/bin/ps" );
+   $ps = "/usr/sbin/ps"       if ( -e "/usr/sbin/ps" );
+   $ps = "/sbin/ps"           if ( -e "/sbin/ps" );
+   $ps = "/usr/local/bin/ps"  if ( -e "/usr/local/bin/ps" );
+   #
+   #
+   # figure out where the uname command is on this system (varies across UNIX flavors)
+   $uname = "/bin/uname"           if ( -e "/bin/uname" );
+   $uname = "/usr/bin/uname"       if ( -e "/usr/bin/uname" );
+   $uname = "/usr/sbin/uname"      if ( -e "/usr/sbin/uname" );
+   $uname = "/sbin/uname"          if ( -e "/sbin/uname" );
+   $uname = "/usr/local/bin/uname" if ( -e "/usr/local/bin/uname" );
+   #
+   # see if user is asking for help
+   &get_usage if ( defined($opt_help) );	#jump to get_usage subroutine if user provides -h or --help parameters
+   #
+   # confirm a process name was supplied as a parameter
+   #
+   if( ! defined( $ARGV[0] ) ) {
+      print "$CHECK_NAME Unknown - missing name of process to check.  Use $0 -h for help\n";
+      exit $UNKNOWN;					#exit script
+   }
+   #
+   # confirm process name contains valid characters
+   $procname = $ARGV[0];
+   unless( $procname =~ /^([-_\w\d%\/\.= ]+)$/ ) {	#process name may contain: letters numbers spaces / - _ . =
+      print "$CHECK_NAME Unknown - Bad process name $procname \n";
+      exit $UNKNOWN;					#exit script
+   }							#end of if/elsif/else block
+}							#end of subroutine
+
+
+
+
+
+
+sub get_usage {
+   #
+   # this subroutine gets called if user enters -h or --help parameters
+   #
+   #
+   print "running get_usage subroutine \n" if ($verbose eq "yes");
+   #
+   if( $opt_help ) {
+      print "Nagios plugin for determining running processes. \n";
+      print "$0 [options] procname \n";
+      print "    where options are: \n";
+      print "    --min=#              (where # is the minimum number of processes to check for)\n";
+      print "    --max=#              (where # is the maximum number of processes to check for)\n";
+      print "    --owner=username     (where username is the optional name of the user that owns the process)\n";
+      print "\n\n";
+      exit;
+   }						#end of if block
+}
+
+
+
+
+
+
+
+sub get_processes {
+   #
+   print "running get_processes subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   #
+   # figure out what operating system we are dealing with
+   $os = `$uname`;					#figure out what operating system we are running
+   chomp $os;						#remove newline
+   if ( $os eq "SunOS" || $os eq "HP-UX" || $os eq "AIX" || $os eq "Linux" || $os eq "VMKernel" ) {
+      print "   operating system = $os   setting ps switches to -ef \n" if ($verbose eq "yes");
+      $ps = "$ps -ef";					#set appropriate switches for ps command
+   } elsif ( $os eq "FreeBSD" || $os eq "OpenBSD" || $os eq "NetBSD" ) {
+      print "   operating system = $os   setting ps switches to -ef \n" if ($verbose eq "yes");
+      $ps = "$ps -ax";					#set appropriate switches for ps command
+   } else {							
+      #
+      # we only get this far if we are running on an unknown operating system
+      #
+      print "$CHECK_NAME Unknown - Could not determine operating system type: $os \n";
+      exit( $UNKNOWN );
+   }							#end of if/elsif/else block
+   #
+   #
+   # Now that we know the operating system type and appropriate switches to use with ps command, let's look at the running processes.
+   #
+   $proc_count = 0;						#initialize variable
+   open (IN,"$ps |");                                	   	#open filehandle using command output
+   while (<IN>) {       	                       		#read a line from filehandle
+      next if ( /$0/ );						#skip the process for this script, which will contain the name of the process we are looking for
+      if ( /^ *([a-zA-Z0-9]+) +[0-9]+ +[0-9]+ .*($procname)/ ) { 			#find the process name in question
+         $owner = $1; 						#assign meaningful variable name
+         print "   found process $procname owned by $owner \n" if ($verbose eq "yes");
+         if ( "$opt_owner" eq "$owner" || "$opt_owner" eq "" ) { #only proceed if the owner matches what was specified on the command line (or blank owner)
+            $proc_count++; 					#increment counter each time the process name is found
+            print "   found process $_ \n" if ($verbose eq "yes");
+         }							#end of if block
+      }								#end of if block
+   }								#end of while loop
+   close IN;   							#close filehandle 
+}								#end of subroutine
+
+
+
+
+
+
+
+
+
+sub print_output {
+   #
+   # this subroutine prints out the results of the nagios check
+   #
+   #
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   #
+   # confirm the number of processes running is within the specified thresholds  
+   #
+   # sanity check to make sure min processes is less than max processes
+   if( $proc_count_min > $proc_count_max ) {
+      print "$CHECK_NAME Unknown - Inconceivable values. Minimum processes are $proc_count_min, but maximum processes are $proc_count_max.  Please adjust.\n";
+      exit( $UNKNOWN );
+   }
+   if( $proc_count < $proc_count_min ) {
+      print "$CHECK_NAME CRITICAL - $proc_count instances of $procname process running.  Should be a minimum of $proc_count_min instances running.\n";
+      exit( $CRITICAL );
+   }						#end of if block
+   if( $proc_count > $proc_count_max ) {
+      print "$CHECK_NAME CRITICAL - $proc_count instances of $procname process running.  Should be a maximum of $proc_count_min instances running.\n";
+      exit( $CRITICAL );
+   }						#end of if block
+   if( $proc_count >= $proc_count_min &&  $proc_count <= $proc_count_max ) {
+      print "$CHECK_NAME OK - $proc_count instances of $procname process running.  min=$proc_count_min max=$proc_count_max owner=$opt_owner \n";
+      exit( $OK );
+   }						#end of if block
+   #
+   # we should never get this far
+   print "$CHECK_NAME Unknown - Inconceivable! Could not determine how many processes were running. \n";
+   exit $UNKNOWN;
+}
+
+
+
+
+
+
+
+
+# -----------------------------------------------------------------
+#    main body of program 
+# -----------------------------------------------------------------
+get_options;	
+sanity_checks;
+get_usage;	
+get_processes;
+print_output;
+
