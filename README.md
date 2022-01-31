@@ -40,5 +40,5 @@ Please note that the --owner switch is optional.  If you do not specify the --ow
  
 If you need to check for a process name that contains embedded spaces, wrap the whole process with escaped quotes.  For example:
 ```
-    check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_proc --min=1 --max=5 owner=root \"/path/to/procname -xyz -abc\""
+    check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_proc --min=1 --max=5 --owner=root \"/path/to/procname -xyz -abc\""
 ```
