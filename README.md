@@ -17,7 +17,7 @@ This assumes that you already have ssh key pairs configured.
        use                             generic-24x7-service
        host_name                       unix11
        service_description             process dhcpd
-       check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_proc --min=1 --max=5 owner=root dhcpd"
+       check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_proc --min=1 --max=5 --owner=root dhcpd"
        }
 ```
 
